@@ -12,4 +12,10 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+thiserror = "1.0"
+hex = "0.4"
+chrono = "0.4"
 ubl-kernel = { path = "../ubl-kernel" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
