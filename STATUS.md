@@ -296,16 +296,16 @@ test result: ok. 7 passed; 0 failed; 0 ignored
 
 ## 🧪 Testing Status
 
-| Crate | Unit Tests | Property Tests | Doc Tests | Integration Tests |
-|-------|------------|----------------|-----------|-------------------|
-| ubl-kernel | 10 ✅ | 8 ✅ | 5 ✅ | N/A |
-| ledger-engine | 7 ✅ | 0 | 1 ✅ | N/A |
-| membrana | 1 (placeholder) | 0 | 0 | 0 |
-| wallet | 1 (placeholder) | 0 | 0 | 0 |
-| policy-engine | 1 (placeholder) | 0 | 0 | 0 |
-| runner | 1 (placeholder) | 0 | 0 | 0 |
+| Crate | Unit + Property Tests | Doc Tests | Total |
+|-------|----------------------|-----------|-------|
+| ubl-kernel | 18 ✅ | 5 ✅ | 23 ✅ |
+| ledger-engine | 7 ✅ | 1 ✅ | 8 ✅ |
+| membrana | 1 (placeholder) | 0 | 1 |
+| wallet | 1 (placeholder) | 0 | 1 |
+| policy-engine | 1 (placeholder) | 0 | 1 |
+| runner | 1 (placeholder) | 0 | 1 |
 
-**Total**: 21 tests passing (excluding placeholders)
+**Total**: 35 tests (29 unit/integration + 6 doc tests)
 
 ---
 
@@ -320,7 +320,8 @@ Finished `release` profile [optimized] target(s) in 1m 50s
 **Last Test Run**: ✅ All Passing
 ```
 cargo test --all-features
-test result: ok. 29 passed; 0 failed; 0 ignored
+test result: ok. 35 passed; 0 failed; 0 ignored
+(7 ledger-engine + 1 membrana + 1 policy-engine + 1 runner + 18 ubl-kernel + 1 wallet + 6 doc tests)
 ```
 
 **Clippy**: ✅ No warnings
