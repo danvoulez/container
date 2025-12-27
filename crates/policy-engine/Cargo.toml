@@ -11,3 +11,9 @@ description = "TDLN DSL to deterministic WASM compiler"
 wasmtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+ubl-kernel = { path = "../ubl-kernel" }
+wasm-encoder = "0.243"
+
+[dev-dependencies]
+hex = "0.4"
