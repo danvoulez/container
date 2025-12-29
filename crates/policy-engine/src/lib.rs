@@ -15,10 +15,10 @@
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let engine = PolicyEngine::new()?;
-//! 
+//!
 //! let policy = Policy::allow_all();
 //! let decision = engine.evaluate(&policy, &serde_json::json!({"action": "read"}))?;
-//! 
+//!
 //! assert_eq!(decision, PolicyDecision::Allow);
 //! # Ok(())
 //! # }
@@ -95,6 +95,11 @@ pub struct PolicyRule {
     /// Rule effect (allow/deny)
     pub effect: PolicyDecision,
     /// Conditions (simplified JSON path matching)
+    ///
+    /// Conditions use a compact `path==value` or `path!=value` syntax where
+    /// `path` is a dot-delimited selector into the JSON context. Values are
+    /// parsed as booleans, numbers, or strings (fallback). All conditions must
+    /// match for the rule to apply; malformed conditions fail closed.
     pub conditions: Vec<String>,
 }
 
@@ -130,14 +135,14 @@ impl Policy {
     /// Compute deterministic hash of the policy
     pub fn compute_hash(&self) -> Vec<u8> {
         use ubl_kernel::{blake3_hash, canonical_json, EventDomain};
-        
+
         // Create a copy without the hash field for canonical representation
         let policy_data = serde_json::json!({
             "id": self.id,
             "version": self.version,
             "rules": self.rules,
         });
-        
+
         let canonical = canonical_json(&policy_data).unwrap_or_default();
         blake3_hash(EventDomain::Decision, canonical.as_bytes()).to_vec()
     }
@@ -173,9 +178,9 @@ impl PolicyEngine {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true); // Enable fuel metering
-        
+
         let engine = Engine::new(&config)?;
-        
+
         Ok(Self { engine })
     }
 
@@ -201,15 +206,15 @@ impl PolicyEngine {
     pub fn evaluate(&self, policy: &Policy, context: &serde_json::Value) -> Result<PolicyDecision> {
         // For now, use simple rule-based evaluation
         // In a full implementation, this would compile to WASM and execute
-        
+
         // If no rules, deny by default
         if policy.rules.is_empty() {
             return Ok(PolicyDecision::Deny);
         }
 
-        // Simple evaluation: check first matching rule
-        // Note: Currently all rules with empty conditions match
-        // TODO: Implement proper condition evaluation when TDLN parser is added
+        // Simple evaluation: check first matching rule. Conditions are
+        // interpreted as AND clauses; failure to parse a condition will fail
+        // closed and move to the next rule.
         for rule in &policy.rules {
             if self.evaluate_conditions(&rule.conditions, context) {
                 return Ok(rule.effect);
@@ -221,30 +226,43 @@ impl PolicyEngine {
     }
 
     /// Evaluate policy conditions (simplified)
-    /// 
-    /// NOTE: Current implementation is simplified:
-    /// - Empty conditions always match (allow-all/deny-all patterns)
-    /// - Non-empty conditions are not yet implemented
-    /// - Will be extended when TDLN DSL parser is added
-    fn evaluate_conditions(&self, conditions: &[String], _context: &serde_json::Value) -> bool {
-        // Empty conditions always match (for allow-all/deny-all policies)
+    ///
+    /// Conditions follow a minimal syntax to keep evaluation deterministic and
+    /// side-effect free:
+    ///
+    /// - `path==value`: matches when the JSON value at `path` equals `value`
+    /// - `path!=value`: matches when the JSON value at `path` does **not**
+    ///   equal `value`
+    ///
+    /// Supported value types: booleans, numbers, and strings. Missing paths or
+    /// malformed conditions fail closed (returning `false`).
+    fn evaluate_conditions(&self, conditions: &[String], context: &serde_json::Value) -> bool {
         if conditions.is_empty() {
             return true;
         }
 
-        // TODO: Implement condition parsing and evaluation
-        // For now, conditions are not supported - return false to be safe
-        false
+        conditions
+            .iter()
+            .all(|condition| match Self::parse_condition(condition) {
+                Some((path, op, expected)) => {
+                    let actual = Self::extract_value(context, &path);
+
+                    match (op, actual) {
+                        (ConditionOp::Equals, Some(value)) => value == &expected,
+                        (ConditionOp::NotEquals, Some(value)) => value != &expected,
+                        // Missing path fails closed to avoid accidental ALLOW
+                        _ => false,
+                    }
+                }
+                None => false,
+            })
     }
 
     /// Compile policy to WASM module
     ///
     /// This creates a simple WASM module that represents the policy logic.
     /// In a full implementation, this would compile TDLN to WASM.
-    /// 
-    /// NOTE: Current implementation only supports single-rule policies
-    /// with empty conditions (allow-all/deny-all patterns).
-    /// Multi-rule policies will use the first rule only.
+    ///
     pub fn compile_to_wasm(&self, policy: &Policy) -> Result<Vec<u8>> {
         use wasm_encoder::*;
 
@@ -273,19 +291,24 @@ impl PolicyEngine {
         exports.export("evaluate", ExportKind::Func, 0);
 
         // Code section - function body
-        // NOTE: Simplified implementation - only uses first rule
-        // TODO: Compile all rules when TDLN parser is added
+        // Evaluate rules in order and return the first matching decision.
+        // Only rules with empty conditions are eligible for WASM compilation;
+        // conditional rules are ignored here (they are evaluated by
+        // `evaluate`). This keeps the module deterministic and side-effect
+        // free while still encoding multi-rule policies that have
+        // unconditional effects.
         let mut function_body = wasm_encoder::Function::new(vec![]);
-        
-        // Determine decision based on first rule with empty conditions
-        let decision = if !policy.rules.is_empty() && policy.rules[0].conditions.is_empty() {
-            match policy.rules[0].effect {
-                PolicyDecision::Allow => 1,
-                PolicyDecision::Deny => 0,
+        let mut decision = 0;
+
+        for rule in &policy.rules {
+            if rule.conditions.is_empty() {
+                decision = match rule.effect {
+                    PolicyDecision::Allow => 1,
+                    PolicyDecision::Deny => 0,
+                };
+                break;
             }
-        } else {
-            0 // Deny by default for policies with conditions or no rules
-        };
+        }
 
         function_body.instruction(&Instruction::I32Const(decision));
         function_body.instruction(&Instruction::End);
@@ -307,16 +330,16 @@ impl PolicyEngine {
     /// Execute WASM module with fuel limit
     pub fn execute_wasm(&self, wasm_bytes: &[u8]) -> Result<PolicyDecision> {
         let module = Module::new(&self.engine, wasm_bytes)?;
-        
+
         let mut store = Store::new(&self.engine, ());
         store.set_fuel(MAX_FUEL)?;
-        
+
         let instance = Instance::new(&mut store, &module, &[])?;
-        
+
         let evaluate = instance
             .get_typed_func::<(), i32>(&mut store, "evaluate")
             .map_err(|e| Error::Execution(e.to_string()))?;
-        
+
         // Execute with fuel limit - errors are caught here
         let result = evaluate.call(&mut store, ()).map_err(|e| {
             // Fuel exhaustion is caught here during execution
@@ -339,6 +362,86 @@ impl PolicyEngine {
     }
 }
 
+/// Operators supported by the lightweight condition parser
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionOp {
+    Equals,
+    NotEquals,
+}
+
+impl PolicyEngine {
+    /// Parse a single condition string into a path, operator, and expected value.
+    ///
+    /// Returns `None` when the condition is malformed.
+    fn parse_condition(condition: &str) -> Option<(Vec<String>, ConditionOp, serde_json::Value)> {
+        let (lhs, op, rhs) = if let Some(idx) = condition.find("==") {
+            (
+                &condition[..idx],
+                ConditionOp::Equals,
+                &condition[idx + 2..],
+            )
+        } else if let Some(idx) = condition.find("!=") {
+            (
+                &condition[..idx],
+                ConditionOp::NotEquals,
+                &condition[idx + 2..],
+            )
+        } else {
+            return None;
+        };
+
+        let path: Vec<String> = lhs
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        if path.is_empty() {
+            return None;
+        }
+
+        let expected = Self::parse_value(rhs.trim());
+
+        Some((path, op, expected))
+    }
+
+    /// Extract a JSON value from the provided context using a dot-delimited
+    /// path. Returns `None` if the path cannot be resolved.
+    fn extract_value<'a>(
+        context: &'a serde_json::Value,
+        path: &[String],
+    ) -> Option<&'a serde_json::Value> {
+        let mut current = context;
+
+        for segment in path {
+            match current {
+                serde_json::Value::Object(map) => {
+                    current = map.get(segment)?;
+                }
+                _ => return None,
+            }
+        }
+
+        Some(current)
+    }
+
+    /// Parse a scalar value from the condition string. Attempts boolean and
+    /// numeric parsing before falling back to a string literal.
+    fn parse_value(raw: &str) -> serde_json::Value {
+        if let Ok(boolean) = raw.parse::<bool>() {
+            serde_json::Value::Bool(boolean)
+        } else if let Ok(number) = raw.parse::<i64>() {
+            serde_json::Value::Number(number.into())
+        } else if let Ok(number) = raw.parse::<f64>() {
+            serde_json::Number::from_f64(number)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+        } else {
+            serde_json::Value::String(raw.trim_matches('"').to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +457,7 @@ mod tests {
         let engine = PolicyEngine::new().unwrap();
         let policy = Policy::allow_all();
         let context = serde_json::json!({"action": "read"});
-        
+
         let decision = engine.evaluate(&policy, &context).unwrap();
         assert_eq!(decision, PolicyDecision::Allow);
     }
@@ -364,8 +467,89 @@ mod tests {
         let engine = PolicyEngine::new().unwrap();
         let policy = Policy::deny_all();
         let context = serde_json::json!({"action": "write"});
-        
+
         let decision = engine.evaluate(&policy, &context).unwrap();
+        assert_eq!(decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn test_policy_conditions_allow_match() {
+        let engine = PolicyEngine::new().unwrap();
+        let policy = Policy {
+            id: "conditional".to_string(),
+            version: "1.0.0".to_string(),
+            rules: vec![
+                PolicyRule {
+                    name: "allow-read-admin".to_string(),
+                    effect: PolicyDecision::Allow,
+                    conditions: vec!["action==read".to_string(), "role==admin".to_string()],
+                },
+                PolicyRule {
+                    name: "deny-default".to_string(),
+                    effect: PolicyDecision::Deny,
+                    conditions: vec![],
+                },
+            ],
+            hash: None,
+        };
+
+        let context = serde_json::json!({"action": "read", "role": "admin"});
+        let decision = engine.evaluate(&policy, &context).unwrap();
+
+        assert_eq!(decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn test_policy_conditions_deny_on_mismatch() {
+        let engine = PolicyEngine::new().unwrap();
+        let policy = Policy {
+            id: "conditional".to_string(),
+            version: "1.0.0".to_string(),
+            rules: vec![
+                PolicyRule {
+                    name: "allow-read-admin".to_string(),
+                    effect: PolicyDecision::Allow,
+                    conditions: vec!["action==read".to_string(), "role==admin".to_string()],
+                },
+                PolicyRule {
+                    name: "deny-default".to_string(),
+                    effect: PolicyDecision::Deny,
+                    conditions: vec![],
+                },
+            ],
+            hash: None,
+        };
+
+        let context = serde_json::json!({"action": "write", "role": "admin"});
+        let decision = engine.evaluate(&policy, &context).unwrap();
+
+        assert_eq!(decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn test_policy_conditions_fail_closed_on_invalid() {
+        let engine = PolicyEngine::new().unwrap();
+        let policy = Policy {
+            id: "invalid".to_string(),
+            version: "1.0.0".to_string(),
+            rules: vec![
+                PolicyRule {
+                    name: "broken".to_string(),
+                    effect: PolicyDecision::Allow,
+                    conditions: vec!["==missinglhs".to_string()],
+                },
+                PolicyRule {
+                    name: "deny-default".to_string(),
+                    effect: PolicyDecision::Deny,
+                    conditions: vec![],
+                },
+            ],
+            hash: None,
+        };
+
+        let context = serde_json::json!({"action": "read"});
+        let decision = engine.evaluate(&policy, &context).unwrap();
+
         assert_eq!(decision, PolicyDecision::Deny);
     }
 
@@ -373,10 +557,10 @@ mod tests {
     fn test_policy_hash_deterministic() {
         let policy1 = Policy::allow_all();
         let policy2 = Policy::allow_all();
-        
+
         let hash1 = policy1.compute_hash();
         let hash2 = policy2.compute_hash();
-        
+
         assert_eq!(hash1, hash2);
     }
 
@@ -384,10 +568,10 @@ mod tests {
     fn test_policy_hash_different() {
         let policy1 = Policy::allow_all();
         let policy2 = Policy::deny_all();
-        
+
         let hash1 = policy1.compute_hash();
         let hash2 = policy2.compute_hash();
-        
+
         assert_ne!(hash1, hash2);
     }
 
@@ -395,7 +579,7 @@ mod tests {
     fn test_compile_to_wasm() {
         let engine = PolicyEngine::new().unwrap();
         let policy = Policy::allow_all();
-        
+
         let wasm = engine.compile_to_wasm(&policy);
         assert!(wasm.is_ok());
         assert!(!wasm.unwrap().is_empty());
@@ -405,10 +589,10 @@ mod tests {
     fn test_execute_wasm_allow() {
         let engine = PolicyEngine::new().unwrap();
         let policy = Policy::allow_all();
-        
+
         let wasm = engine.compile_to_wasm(&policy).unwrap();
         let decision = engine.execute_wasm(&wasm).unwrap();
-        
+
         assert_eq!(decision, PolicyDecision::Allow);
     }
 
@@ -416,11 +600,38 @@ mod tests {
     fn test_execute_wasm_deny() {
         let engine = PolicyEngine::new().unwrap();
         let policy = Policy::deny_all();
-        
+
         let wasm = engine.compile_to_wasm(&policy).unwrap();
         let decision = engine.execute_wasm(&wasm).unwrap();
-        
+
         assert_eq!(decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn test_compile_to_wasm_prefers_first_unconditional_rule() {
+        let engine = PolicyEngine::new().unwrap();
+        let policy = Policy {
+            id: "multi-rule".to_string(),
+            version: "1.0.0".to_string(),
+            rules: vec![
+                PolicyRule {
+                    name: "conditional-deny".to_string(),
+                    effect: PolicyDecision::Deny,
+                    conditions: vec!["action==write".to_string()],
+                },
+                PolicyRule {
+                    name: "allow-unconditional".to_string(),
+                    effect: PolicyDecision::Allow,
+                    conditions: vec![],
+                },
+            ],
+            hash: None,
+        };
+
+        let wasm = engine.compile_to_wasm(&policy).unwrap();
+        let decision = engine.execute_wasm(&wasm).unwrap();
+
+        assert_eq!(decision, PolicyDecision::Allow);
     }
 
     #[test]
@@ -433,7 +644,7 @@ mod tests {
         let allow = PolicyDecision::Allow;
         let json = serde_json::to_string(&allow).unwrap();
         assert_eq!(json, "\"ALLOW\"");
-        
+
         let deny = PolicyDecision::Deny;
         let json = serde_json::to_string(&deny).unwrap();
         assert_eq!(json, "\"DENY\"");
